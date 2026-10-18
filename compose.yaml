@@ -1,0 +1,114 @@
+name: open-kyc
+
+# Keep json-file logs from growing unbounded on self-hosted disks.
+x-logging: &logging
+  logging:
+    driver: json-file
+    options:
+      max-size: '10m'
+      max-file: '3'
+
+services:
+  postgres:
+    <<: *logging
+    image: postgres:17-alpine
+    restart: unless-stopped
+    mem_limit: 768m
+    environment:
+      POSTGRES_USER: openkyc
+      POSTGRES_DB: openkyc
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Run npm run selfhost:init}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U openkyc -d openkyc']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+  redis:
+    <<: *logging
+    image: redis:7-alpine
+    restart: unless-stopped
+    mem_limit: 256m
+    command: [sh, -c, 'exec redis-server --appendonly yes --requirepass "$$REDIS_PASSWORD"']
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Run npm run selfhost:init}
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: [CMD-SHELL, 'redis-cli -a "$$REDIS_PASSWORD" ping | grep PONG']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+  falkordb:
+    <<: *logging
+    image: falkordb/falkordb:latest
+    restart: unless-stopped
+    ports:
+      - '${FALKORDB_BIND:-127.0.0.1}:${FALKORDB_PORT:-6380}:6379'
+    volumes:
+      - falkordb-data:/data
+    healthcheck:
+      test: [CMD-SHELL, 'redis-cli ping | grep PONG']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+  ocr-indra:
+    <<: *logging
+    build:
+      context: ./server/ocr-indra
+    restart: unless-stopped
+    init: true
+    mem_limit: 1g
+    ports:
+      - '${INDRA_BIND:-127.0.0.1}:${INDRA_PORT:-8001}:8001'
+    environment:
+      PORT: '8001'
+  migrate:
+    <<: *logging
+    build: .
+    image: open-kyc:local
+    # Plain node: the server and migrate entrypoints are bundled to JS.
+    command: [node, build/server/migrate.js]
+    env_file: .env
+    environment: &environment
+      DATABASE_URL: postgresql://openkyc:${POSTGRES_PASSWORD}@postgres:5432/openkyc
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
+      FALKORDB_HOST: falkordb
+      FALKORDB_PORT: '6379'
+      FALKORDB_GRAPH: ${FALKORDB_GRAPH:-openkyc_aml}
+      INDRA_OCR_URL: ${INDRA_OCR_URL:-http://ocr-indra:8001}
+      NODE_ENV: production
+      PORT: 3000
+      STORAGE_PATH: /app/data/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+  app:
+    <<: *logging
+    build: .
+    image: open-kyc:local
+    restart: unless-stopped
+    init: true
+    mem_limit: 1g
+    env_file: .env
+    environment: *environment
+    ports:
+      - '${BIND_ADDRESS:-127.0.0.1}:${APP_PORT:-3000}:3000'
+    volumes:
+      - document-data:/app/data/uploads
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://localhost:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+volumes:
+  postgres-data:
+  redis-data:
+  document-data:
+  falkordb-data:

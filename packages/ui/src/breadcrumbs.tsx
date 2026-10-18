@@ -1,0 +1,86 @@
+"use client"
+
+import { ChevronRightIcon } from "@heroicons/react/24/solid"
+import { createContext, use, useMemo } from "react"
+import { Breadcrumb, Breadcrumbs as BreadcrumbsPrimitive } from "react-aria-components"
+import { twMerge } from "tailwind-merge"
+import { Link } from "./link"
+import type { ReactNode } from "react";
+import type { BreadcrumbProps, BreadcrumbsProps, LinkProps } from "react-aria-components"
+import { cx } from "~/lib/primitive"
+
+type BreadcrumbsContextProps = { separator?: "chevron" | "slash" | boolean }
+const BreadcrumbsProvider = createContext<BreadcrumbsContextProps>({
+  separator: "chevron",
+})
+
+const Breadcrumbs = <T extends object>({
+  className,
+  ...props
+}: BreadcrumbsProps<T> & BreadcrumbsContextProps) => {
+  const contextValue = useMemo(() => ({ separator: props.separator }), [props.separator])
+  return (
+    <BreadcrumbsProvider value={contextValue}>
+      <BreadcrumbsPrimitive {...props} className={twMerge("flex items-center gap-2", className)} />
+    </BreadcrumbsProvider>
+  )
+}
+
+interface BreadcrumbsItemProps extends BreadcrumbProps, BreadcrumbsContextProps {
+  href?: string
+  children?: ReactNode
+}
+
+const BreadcrumbsItem = ({
+  href,
+  separator = true,
+  className,
+  children,
+  ...props
+}: BreadcrumbsItemProps & Partial<Omit<LinkProps, "className">>) => {
+  const { separator: contextSeparator } = use(BreadcrumbsProvider)
+  separator = contextSeparator ?? separator
+  const separatorValue = separator === true ? "chevron" : separator
+
+  return (
+    <Breadcrumb
+      className={cx("flex items-center gap-2 text-sm", className)}
+      data-slot="breadcrumb-item"
+      {...props}
+    >
+      {({ isCurrent }) => (
+        <>
+          <Link
+            href={href}
+            slot={props.slot ?? undefined}
+            className={typeof className === "function" ? className({
+              ...props,
+              defaultClassName: "",
+              isCurrent: false,
+              isDisabled: false // explicitly set to boolean
+            }) : className}
+          >
+            {children}
+          </Link>
+          {!isCurrent && separator !== false && <Separator separator={separatorValue} />}
+        </>
+      )}
+    </Breadcrumb>
+  )
+}
+
+const Separator = ({
+  separator = "chevron",
+}: {
+  separator?: BreadcrumbsItemProps["separator"]
+}) => {
+  return (
+    <span className="*:shrink-0 *:text-muted-fg *:data-[slot=icon]:size-3.5">
+      {separator === "chevron" && <ChevronRightIcon />}
+      {separator === "slash" && <span className="text-muted-fg">/</span>}
+    </span>
+  )
+}
+
+export type { BreadcrumbsProps, BreadcrumbsItemProps }
+export { Breadcrumbs, BreadcrumbsItem }

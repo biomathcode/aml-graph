@@ -1,0 +1,21 @@
+{
+  "name": "@open-kyc/falkordb-aml",
+  "version": "1.0.0",
+  "description": "FalkorDB-powered Anti-Money Laundering (AML) Graph Algorithms and Typology Detection Library",
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "ioredis": "^5.8.2"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.0",
+    "vitest": "^3.2.4"
+  }
+}

@@ -1,0 +1,1 @@
+export default function Client(){return <section className="max-w-7xl mx-auto px-8 py-16"><h2 className="text-lg text-neutral-500 mb-6">Your infrastructure. Your documents.</h2><div className="flex flex-wrap gap-8 text-xl font-semibold">{['PostgreSQL','Redis','Amazon S3','Google Cloud Storage','Cloudflare R2'].map(name=><span key={name}>{name}</span>)}</div></section>}

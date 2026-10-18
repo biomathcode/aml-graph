@@ -1,0 +1,23 @@
+services:
+  postgres:
+    ports:
+      - '127.0.0.1:5432:5432'
+  redis:
+    ports:
+      - '127.0.0.1:6379:6379'
+  falkordb:
+    image: falkordb/falkordb:latest
+    ports:
+      - '127.0.0.1:6380:6379'
+    volumes:
+      - falkordb-data:/data
+  ocr-indra:
+    build:
+      context: ./server/ocr-indra
+    ports:
+      - '127.0.0.1:8001:8001'
+    environment:
+      PORT: '8001'
+
+volumes:
+  falkordb-data:
