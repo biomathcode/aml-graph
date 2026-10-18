@@ -168,7 +168,7 @@ No graph evidence is needed to notice the human red flags either: the payroll ac
 
 ## Graph retrieval (GraphRAG) with FalkorDB
 
-The compliance chat at `/agent` answers from a knowledge graph — graph retrieval-augmented generation (GraphRAG) implemented in-process, with no separate GraphRAG or Python service. FalkorDB speaks the Redis protocol, so the API talks to it directly through `@open-kyc/falkordb-aml` (`packages/falkordb-aml/`), an ioredis-based client used for ingestion, the AML algorithms, and retrieval alike.
+The compliance chat at `/agent` answers from a knowledge graph — graph retrieval-augmented generation (GraphRAG) implemented in-process, with no external GraphRAG framework or Python service. FalkorDB speaks the Redis protocol, so the API talks to it directly through `@open-kyc/falkordb-aml` (`packages/falkordb-aml/`), an ioredis-based client used for ingestion, the AML algorithms, and retrieval alike.
 
 ### Deployment
 
@@ -210,7 +210,7 @@ Embedding is best-effort: without `NVIDIA_API_KEY`, or when the provider fails, 
 
 ### How the chat retrieves
 
-`server/ai/retrieval/` routes each question deterministically — the LLM never picks its own tools — and fans the retrievers out one by one, streaming each step to the UI:
+`server/ai/retrieval/` routes each question deterministically — the LLM never picks its own tools — and fans retrieval out across sources, streaming each step to the UI:
 
 | Retriever | Source | Returns |
 | --- | --- | --- |

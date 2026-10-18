@@ -43,5 +43,5 @@ COPY --from=build --chown=node:node /app/server/db/migrations ./server/db/migrat
 RUN mkdir -p /app/data/uploads && chown -R node:node /app/data
 USER node
 EXPOSE 3000
-# node --init: signal-handling + zombie reaping without an extra process.
-CMD ["node", "--init", "build/server/index.js"]
+# Zombie reaping comes from Compose's `init: true`.
+CMD ["node", "build/server/index.js"]
