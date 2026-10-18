@@ -18,25 +18,129 @@ Self-hosted know-your-customer (KYC) application for document collection and man
 
 ```mermaid
 sequenceDiagram
+  autonumber
   actor O as Operator
   actor S as Subject
-  participant A as Express API
-  participant D as PostgreSQL, Redis, files
-  participant P as OCR and graph pipeline
+  participant API as Express API
+  participant DB as PostgreSQL & Redis
+  participant OCR as Indra OCR & Tesseract Ensemble
+  participant FDB as FalkorDB (Identity Graph & Vectors)
+  participant AML as AML Scorer (@open-kyc/falkordb-aml)
 
-  O->>A: create workflow and collection session
-  A-->>O: secret collection link
+  O->>API: create workflow and collection session
+  API-->>O: secret collection link
   O->>S: share link
-  S->>A: upload documents, then submit
-  A->>D: store file bytes and records
-  A->>P: queue enrichment
-  P->>D: extracted fields and AML risk report
-  A-->>O: live update
-  O->>A: approve or reject with notes
-  A->>D: append audit record
+  S->>API: upload documents + identity hints + telemetry
+  API->>DB: store raw file bytes, session state, connection IP & deviceId
+  API->>OCR: enqueue extraction (schema-driven)
+  par Dual-Engine Extraction
+    OCR->>OCR: probe Indra service + parse schema / TD3 MRZ
+    OCR->>OCR: execute local Tesseract ensemble fallback
+  end
+  OCR->>OCR: arbitrate field confidence & digit integrity
+  OCR-->>API: normalized fields (first_name, doc_number, tax_id, accounts)
+  API->>FDB: ingestOcrIntoGraph (MERGE :Person, :Document, :Identifier, :Account)
+  API->>FDB: embedSessionGraph (2048-dim vecf32 embeddings via NVIDIA NIM)
+  API->>AML: run AML detectors (cycles, smurfing, scatter-gather, DPRK screening)
+  AML->>FDB: execute Cypher traversals & GraphBLAS algorithms
+  AML-->>API: risk signals, score (0-100), and SAR narrative
+  API->>DB: update session with AML risk report & status
+  API-->>O: live WebSocket update (SSE / Redis PubSub)
+  O->>API: review signals, inspect graph evidence, approve or reject
+  API->>DB: append immutable audit log
 ```
 
-Collection and review are separate states: a completed collection can still have a pending review, and the application does not infer identity validity from an upload.
+Collection and review are separate states: a completed collection can still have a pending review, and the application does not infer identity validity from an upload alone.
+
+### Indra OCR and extraction ensemble
+
+The document extraction pipeline uses a resilient, dual-engine architecture (`server/ocr.ts` and `server/ocr-indra/`) to guarantee field accuracy without blocking the event loop:
+
+1. **Fast Probing & Health Check**: Before uploading document bytes, the pipeline issues a 1.5-second probe to the Indra OCR Python microservice (`/health`). If unreachable or timing out, it fails over immediately to the local Tesseract ensemble without introducing network lag.
+2. **Schema-Driven Extraction**: Documents are parsed according to structured schemas (`passport`, `driving_license`, `national_id`, `utility_bill`, `bank_statement`, `tax_form`, `resume`). For travel documents, the engine executes a dedicated TD3 Machine Readable Zone (MRZ) parser for line 1 and line 2 check-digits.
+3. **Dual-Engine Quality Arbitration**: Even when Indra answers successfully, the local Tesseract pass runs concurrently. A deterministic arbitration engine merges the extractions field-by-field:
+   - Compares per-field confidence scores.
+   - Enforces digit integrity on identifier fields (preventing dropped numbers in passports or tax IDs).
+   - Resolves printed form labels (`Surname`, `Given Names`, `Nationality`).
+   - Tags the resulting extraction as `indra-ocr+local-fallback` or `local-tesseract-fallback`.
+
+```mermaid
+flowchart TD
+  DOC["Uploaded Document (Image / PDF)"] --> PROBE{"Probe Indra OCR Service (/health, 1.5s timeout)"}
+
+  PROBE -->|"Online"| INDRA["Indra OCR Service (/api/ocr/extract)"]
+  PROBE -->|"Offline / Timeout"| TESS["Local Tesseract Ensemble Engine"]
+
+  INDRA --> ARB["Field-Level Quality Arbitration Engine"]
+  TESS --> ARB
+
+  subgraph Arbitration["Arbitration & Validation"]
+    ARB --> C1["Compare Per-Field Confidence"]
+    ARB --> C2["Digit & Regex Validation (Tax ID, MRZ, Doc Number)"]
+    ARB --> C3["Printed Label Parsing (Surname / Given Names)"]
+  end
+
+  Arbitration --> OUT["Normalized Extracted Fields + Full Markdown Text"]
+```
+
+### FalkorDB graph ingestion and vector indexing
+
+Once fields are extracted, `server/aml/ocr-to-graph.ts` deterministically translates them into an in-memory property graph inside FalkorDB:
+
+1. **Subject Anchor (`:Person`)**: A unique node representing the applicant, keyed by the collection session ID.
+2. **Document Provenance (`:Document`)**: One node per uploaded file (`doc_<sessionId>_<type>`), capturing extracted category, document numbers, OCR engine provenance, and financial attributes (`closing_balance`, `amount_due`). Linked via `[:SUBMITTED_DOCUMENT]`.
+3. **Cross-Session Anchors (`:Identifier`)**: Normalized, lowercase nodes created for every identity anchor:
+   - `documentNumber`
+   - `taxId` / SSN
+   - `address`
+   - `email`
+   - `phone`
+   - `ip` (client edge IP captured at upload)
+   - `deviceId` (client device hardware fingerprint)
+   
+   Every `:Person` is linked via `[:HAS_IDENTIFIER {type}]`. **Shared `:Identifier` nodes are what connect separate subjects across time, immediately exposing laptop farms, identity reuse, and synthetic rings.**
+4. **Financial Accounts (`:Account`)**: Financial institutions and account numbers extracted from utility bills, statements, and tax forms are merged as `:Account` nodes and connected via `[:OWNS {role: 'owner'}]`.
+5. **Multimodal Vector Indexing (`server/aml/graph-vectors.ts`)**:
+   - The node's ground-truth business properties are rendered into deterministic, sorted `key: value` text.
+   - Embedded into 2048-dimensional dense vectors using NVIDIA NIM (`nvidia/nemotron-3-embed-1b`).
+   - Stored on nodes as `vecf32` properties indexed with cosine similarity (`CREATE VECTOR INDEX FOR (n:Document) ON (n.embedding)...`).
+   - Enables hybrid GraphRAG: the compliance agent searches vectors with `db.idx.vector.queryNodes` and immediately traverses neighboring graph edges to verify signals.
+
+```mermaid
+flowchart LR
+  subgraph Extracted["Normalized OCR Fields & Telemetry"]
+    F1["Name, DOB, Nationality"]
+    F2["Document Number, Category, Type"]
+    F3["Tax ID, Phone, Email, Address"]
+    F4["Client IP & Hardware Device Fingerprint"]
+    F5["Account Number, Bank Name, Balance"]
+  end
+
+  subgraph FalkorGraph["FalkorDB Property Graph & Vector Index"]
+    P[":Person (id: sessionId)"]
+    D[":Document (id: doc_sessionId_type, embedding: vecf32)"]
+    I1[":Identifier (type: documentNumber)"]
+    I2[":Identifier (type: taxId)"]
+    I3[":Identifier (type: deviceId)"]
+    I4[":Identifier (type: ip)"]
+    A[":Account (id: acc_accountNumber)"]
+
+    P -->|SUBMITTED_DOCUMENT| D
+    P -->|HAS_IDENTIFIER| I1
+    P -->|HAS_IDENTIFIER| I2
+    P -->|HAS_IDENTIFIER| I3
+    P -->|HAS_IDENTIFIER| I4
+    P -->|"OWNS {role: 'owner'}"| A
+  end
+
+  F1 --> P
+  F2 --> D
+  F3 --> I1
+  F3 --> I2
+  F4 --> I3
+  F4 --> I4
+  F5 --> A
+```
 
 ## Architecture
 
@@ -134,9 +238,213 @@ Four graph facts expose what a per-customer review cannot see:
 
 The same detector run covers structuring (fan-in/fan-out below the $10,000 reporting threshold), scatter-gather mule layering, and distance-decayed sanctions exposure (0.65 decay per hop, up to 4 hops), so the reviewer sees the whole picture before approving.
 
+### Core AML typologies and graph algorithms
+
+The `@open-kyc/falkordb-aml` engine executes deterministic graph-theoretic detectors directly against FalkorDB:
+
+#### 1. Entity resolution and synthetic identity clustering (`entityResolution.ts`)
+
+Fraud rings and bad actors often submit multiple applications using borrowed, synthetic, or altered credentials. Rather than checking fields in isolation, the detector queries for shared identifier anchors:
+
+```cypher
+MATCH (p1:Person)-[:HAS_IDENTIFIER]->(i:Identifier)<-[:HAS_IDENTIFIER]-(p2:Person)
+WHERE p1.id < p2.id
+RETURN p1.id AS p1_id, p2.id AS p2_id, collect(i.type) AS shared_types, collect(i.val) AS shared_vals
+```
+
+Shared attributes carry deterministic weights:
+- `documentNumber`: **1.0**
+- `taxId`: **0.95**
+- `deviceId`: **0.85**
+- `phone`: **0.80**
+- `email`: **0.75**
+- `ip`: **0.65**
+- `address`: **0.55**
+
+When the cumulative pairwise similarity meets or exceeds the `0.65` threshold, the identities resolve into a unified cluster.
+
+```mermaid
+graph LR
+  subgraph Cluster["Identity Resolution Cluster (Similarity Score: 0.99)"]
+    P1["Person: Victor Vance (Individual)"]
+    P2["Person: V. Vance Holdings LLC (Entity)"]
+    I1["Identifier: SSN-000-88-7777 (weight 0.95)"]
+    I2["Identifier: DEV-FINGERPRINT-X99 (weight 0.85)"]
+    I3["Identifier: +1-503-555-0192 (weight 0.80)"]
+    I4["Identifier: 742 Evergreen Terrace (weight 0.55)"]
+  end
+
+  P1 -->|HAS_IDENTIFIER| I1
+  P2 -->|HAS_IDENTIFIER| I1
+  P1 -->|HAS_IDENTIFIER| I2
+  P2 -->|HAS_IDENTIFIER| I2
+  P1 -->|HAS_IDENTIFIER| I3
+  P2 -->|HAS_IDENTIFIER| I3
+  P1 -->|HAS_IDENTIFIER| I4
+  P2 -->|HAS_IDENTIFIER| I4
+```
+
+#### 2. Circular flow and round-tripping cycle detection (`cycleDetection.ts`)
+
+Launderers route money through international shell entities and layered trusts only to return the funds to the initial beneficial owner, creating a legitimate appearance of commercial revenue. The detector checks for 3-hop, 4-hop, and 5-hop directed cycles:
+
+```cypher
+MATCH (a:Account)-[t1:TRANSFERRED]->(b:Account)-[t2:TRANSFERRED]->(c:Account)-[t3:TRANSFERRED]->(a:Account)
+WHERE a.id < b.id AND a.id < c.id AND b.id <> c.id
+RETURN a.id AS a_id, b.id AS b_id, c.id AS c_id, t1, t2, t3
+```
+
+Cycles are flagged if:
+1. **Duration**: Min-to-max transfer timestamp delta is $\le 720\text{ hours}$ (30 days).
+2. **Fund preservation**: At least $60\%$ of the initial capital survives round-trip transaction fees ($\text{returnedAmt} / \text{initialAmt} \ge 0.60$).
+
+```mermaid
+graph LR
+  A["Account A (AlphaBank, Cayman)"]
+  B["Account B (BetaFinancial, Panama)"]
+  C["Account C (BVI Trust)"]
+
+  A -->|"1. $50,000 (t0)"| B
+  B -->|"2. $48,500 (t0 + 3h)"| C
+  C -->|"3. $47,000 (t0 + 8h)"| A
+```
+
+#### 3. Smurfing and structuring (`smurfing.ts`)
+
+Statutory rules (such as Bank Secrecy Act Currency Transaction Reports) mandate filing when cash transactions reach $10,000. Bad actors evade detection by breaking payments into sub-threshold increments ($5,000–$9,999):
+
+- **Fan-In (Accumulation)**: Multiple origin accounts transfer sub-threshold amounts into one collector account within a 72-hour window.
+- **Fan-Out (Dispersion)**: A single origin account disperses sub-threshold payments across multiple beneficiaries.
+
+```mermaid
+graph TD
+  subgraph FanIn["Fan-In Structuring (Accumulation under $10,000 CTR)"]
+    S1["Origin Account 1"] -->|"$9,200"| AGG["Accumulator Account (Total: $27,600)"]
+    S2["Origin Account 2"] -->|"$8,900"| AGG
+    S3["Origin Account 3"] -->|"$9,500"| AGG
+  end
+
+  subgraph FanOut["Fan-Out Structuring (Rapid Dispersion)"]
+    SRC["Dispersal Account ($25,000)"] -->|"$8,500"| D1["Beneficiary 1"]
+    SRC -->|"$9,100"| D2["Beneficiary 2"]
+    SRC -->|"$7,400"| D3["Beneficiary 3"]
+  end
+```
+
+#### 4. Scatter-gather mule layering (`scatterGather.ts`)
+
+To break direct linear audits, a source account splits capital across $N$ intermediary money-mule accounts, which promptly recombine at a single destination account within 24–72 hours:
+
+```mermaid
+graph LR
+  SRC["Origin Account (Dispersal)"]
+  M1["Mule Account 1"]
+  M2["Mule Account 2"]
+  M3["Mule Account 3"]
+  DST["Destination Beneficiary (Consolidation)"]
+
+  SRC -->|"Scatter $15,000"| M1
+  SRC -->|"Scatter $15,000"| M2
+  SRC -->|"Scatter $15,000"| M3
+
+  M1 -->|"Gather $14,200"| DST
+  M2 -->|"Gather $14,300"| DST
+  M3 -->|"Gather $14,500"| DST
+```
+
+#### 5. PageRank and flow hub centrality (`centrality.ts`)
+
+FalkorDB's embedded GraphBLAS engine calculates global network centrality across all accounts via `CALL algo.pageRank('Account', 'TRANSFERRED')`. By cross-referencing PageRank with the inbound-to-outbound volume flow ratio, accounts are categorized into functional operational roles:
+
+- **Funnel Aggregator** ($\text{In/Out Ratio} > 3.0$): Funnel accounts gathering funds from many depositors.
+- **Dispersion Source** ($\text{In/Out Ratio} < 0.33$): Primary distribution accounts feeding mule layers.
+- **Transit Hub** (High PageRank, balanced In/Out): High-velocity pass-through conduit accounts.
+
+```mermaid
+graph LR
+  subgraph Aggregator["Funnel Aggregator (In/Out > 3.0)"]
+    IN1["Deposit 1"] --> AGG["Collection Account"]
+    IN2["Deposit 2"] --> AGG
+    IN3["Deposit 3"] --> AGG
+    AGG --> OUT1["Outflow"]
+  end
+
+  subgraph Transit["Transit Hub (PageRank Top 5%, Flow Balanced)"]
+    T_IN["Rapid Inflow"] --> HUB["Conduit Account (High Centrality)"]
+    HUB --> T_OUT["Rapid Outflow"]
+  end
+
+  subgraph Disperser["Dispersion Source (In/Out < 0.33)"]
+    DISP["Primary Source"] --> D_OUT1["Dispersal 1"]
+    DISP --> D_OUT2["Dispersal 2"]
+    DISP --> D_OUT3["Dispersal 3"]
+  end
+```
+
+#### 6. Distance-decayed sanctions exposure tracing (`riskTracing.ts`)
+
+Direct sanctions screening only checks the immediate account holder. Launderers evade direct hits by introducing 1 to 4 intermediary entities. OpenKYC traverses directed transfer paths up to 4 hops away from known Office of Foreign Assets Control (OFAC) Specially Designated Nationals (SDNs) or Politically Exposed Persons (PEPs):
+
+$$\text{Exposure Score} = \text{BaseRisk} \times 0.65^{\text{hops}}$$
+
+- **1 Hop**: $65.0\%$ exposure
+- **2 Hops**: $42.3\%$ exposure
+- **3 Hops**: $27.5\%$ exposure
+- **4 Hops**: $17.9\%$ exposure
+
+```mermaid
+graph LR
+  SUB["Subject Account (Under Review)"]
+  HOP1["Hop 1: Intermediary Bank (65% exposure)"]
+  HOP2["Hop 2: Offshore Exchange (42.3% exposure)"]
+  HOP3["Hop 3: Correspondent Conduit (27.5% exposure)"]
+  SANCTION["Sanctioned Account / OFAC SDN (100% risk)"]
+
+  SUB -->|"TRANSFERRED"| HOP1
+  HOP1 -->|"TRANSFERRED"| HOP2
+  HOP2 -->|"TRANSFERRED"| HOP3
+  HOP3 -->|"TRANSFERRED"| SANCTION
+```
+
 ### Detecting a North Korean IT worker in your organization
 
 North Korean IT workers take remote positions under falsified — often stolen — identities, appear domestic by working through third-party "laptop farms", and route their salaries (frequently in cryptocurrency) to DPRK front companies. Paying them can violate sanctions law: UNSCR 2397 requires repatriating DPRK nationals earning income in your jurisdiction, FATF keeps the DPRK on its call-for-action blacklist, and OFAC designates the front companies that collect the revenue.
+
+```mermaid
+graph TD
+  subgraph Operatives["DPRK IT Worker Operatives"]
+    OP1["Operative: Grace Miller (Stolen Identity)"]
+    OP2["Operative: Daniel Cooper (Stolen Identity)"]
+  end
+
+  subgraph Infrastructure["Shared Laptop Farm Infrastructure"]
+    DEV["Device Fingerprint: DEV-LAPTOP-FARM-22"]
+    IP["DPRK IP Range: 175.45.176.0/24"]
+  end
+
+  subgraph Employers["Western Tech Platforms"]
+    EMP1["AI Evaluation Platform (Mercor / DataAnnotation)"]
+    EMP2["Remote Tech Client"]
+  end
+
+  subgraph Financial["Salary Siphoning Channels"]
+    MULE["Mule Bank Account (30% retained)"]
+    CRYPTO["Crypto OTC / Swap (USDT Conversion)"]
+    FRONT["OFAC Sanctioned Front (Korea Osong / Chonsurim)"]
+  end
+
+  OP1 -->|HAS_IDENTIFIER| DEV
+  OP2 -->|HAS_IDENTIFIER| DEV
+  OP1 -->|HAS_IDENTIFIER| IP
+  OP2 -->|HAS_IDENTIFIER| IP
+
+  EMP1 -->|"Salary Deposit"| MULE
+  EMP2 -->|"Salary Deposit"| MULE
+
+  OP1 -->|OWNS| MULE
+  MULE -->|"70% Wire"| CRYPTO
+  CRYPTO -->|"Remittance"| FRONT
+```
 
 Every person in the graph is scored against eight weighted indicators modeled on the July 2026 multi-government advisory:
 
